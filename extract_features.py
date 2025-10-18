@@ -11,10 +11,10 @@ ANNOTATIONS_PATH = Path("data/annotations.tsv")
 
 #Path to save
 OUTPUT_PATH = Path("results/dataset_analysis")
-FEATURES_PATH = OUTPUT_PATH / "LANDMARKS"
-EXAMPLE_IMAGES_PATH = OUTPUT_PATH / "example_image.JPG"
+FEATURES_PATH = OUTPUT_PATH / "LANDMARKS_mc3"
+EXAMPLE_IMAGES_PATH = OUTPUT_PATH / "example_image_mc3.JPG"
 
-#Create dir's
+#Create dir'sддд
 FEATURES_PATH.mkdir(parents=True, exist_ok=True)
 OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -26,10 +26,10 @@ mp_drawing_styles = mp.solutions.drawing_styles
 
 #Initiazlization hands with default parameters
 with mp_hands.Hands(
-    static_image_mode=True,
     max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
+    model_complexity=1,
+    min_detection_confidence=0.8,
+    min_tracking_confidence=0.7,
 ) as hands:
     try:
         import pandas as pd
@@ -88,14 +88,19 @@ with mp_hands.Hands(
             if results.multi_hand_landmarks:
                 hand_idx = 0
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                    for lm_idx, landmark in enumerate(hand_landmarks.landmark):
-                        px, py, pz = landmark.x, landmark.y, landmark.z
-                        # hand 1 + hand 2
-                        start_idx = hand_idx * 21 * 3
-                        flat_landmarks[start_idx + lm_idx * 3] = px
-                        flat_landmarks[start_idx + lm_idx * 3 + 1] = py
-                        flat_landmarks[start_idx + lm_idx * 3 + 2] = pz
+                    raw_lm_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark])
+                    wrist = raw_lm_array[0]  # (x, y, z) запястья
+                    centered_lm_array = raw_lm_array - wrist  # broadcasting
+                    ref_point1 = centered_lm_array[1]  # Большой палец
+                    ref_point2 = centered_lm_array[17]  # Мизинец
+                    scale = np.linalg.norm(ref_point1 - ref_point2)
+                    if scale > 0:
+                        normalized_lm_array = centered_lm_array / scale
+                    else:
+                        normalized_lm_array = centered_lm_array
+                    flat_hand_landmarks = normalized_lm_array.flatten()
+                    start_idx = hand_idx * 21 * 3
+                    flat_landmarks[start_idx: start_idx + 21 * 3] = flat_hand_landmarks
 
                     hand_idx += 1
                     if hand_idx >= 2:  # Once more checking 2 hands
