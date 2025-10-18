@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pack_padded_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from sklearn.metrics import accuracy_score, f1_score
 
 #Parametrs
@@ -22,9 +22,9 @@ ANNOTATIONS_FILE = Path("data/annotations.tsv")
 OUTPUT_DIR = Path("results/model_training")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 50
+NUM_EPOCHS = 100
 DROPOUT_RATE = 0.5
 MAX_SEQ_LENGTH = 150
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,7 +34,6 @@ SCALER_PATH = OUTPUT_DIR / "scaler.pkl"
 BEST_MODEL_PATH = OUTPUT_DIR / "best_model.pth"
 HISTORY_PATH = OUTPUT_DIR / "training_history.pkl"
 SEED = 4312
-
 
 def set_seed(seed=SEED):
     random.seed(seed)
@@ -160,61 +159,101 @@ def compute_mean_std_for_files(features_dir: Path, video_id_list: List[str]) -> 
 # ------------------------
 # CNN (time-preserving) + LSTM
 # ------------------------
-class LandmarksCNNLSTM(nn.Module):
-    def __init__(self, input_feat=127, num_classes=32, cnn_channels=[64, 128], hidden_size=256, num_layers=2, dropout=0.5):
+class AttentionPool(nn.Module):
+    """Simple attention pooling over temporal axis.
+       Input: (batch, seq_len, feat)
+       Output: (batch, feat)
+    """
+    def __init__(self, feat_dim):
         super().__init__()
-        #decreasing time dimension by factor = 2*2 = 4
+        self.proj = nn.Linear(feat_dim, feat_dim // 2)
+        self.v = nn.Linear(feat_dim // 2, 1)
+
+    def forward(self, x, lengths):
+        # x: (batch, T, feat)
+        att = torch.tanh(self.proj(x))            # (batch, T, d)
+        scores = self.v(att).squeeze(-1)         # (batch, T)
+        # mask padded positions
+        device = x.device
+        max_len = x.size(1)
+        mask = (torch.arange(max_len, device=device)[None, :] < lengths[:, None]).float()  # 1 for valid
+        scores = scores.masked_fill(mask == 0, float('-1e9'))
+        weights = torch.softmax(scores, dim=1)   # (batch, T)
+        out = (x * weights.unsqueeze(-1)).sum(dim=1)  # (batch, feat)
+        return out
+
+class LandmarksCNNLSTM(nn.Module):
+    def __init__(self, input_feat=127, num_classes=32,
+                 cnn_channels=[64, 128], hidden_size=256, num_layers=2, dropout=0.5):
+        super().__init__()
+        # temporal reduction factor = 2 * 2 = 4
         self.pool_factor = 4
 
-        # Conv1d: channels=input_feat, treat 'features' as channels, temporal axis is sequence length
-        self.cnn = nn.Sequential(
-            nn.Conv1d(in_channels=input_feat, out_channels=cnn_channels[0], kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),  # /2
-            nn.Dropout(dropout),
-            nn.Conv1d(in_channels=cnn_channels[0], out_channels=cnn_channels[1], kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),  # /2 -> total /4
-            nn.Dropout(dropout),
-            # now temporal dimension is ~= orig_len/4, channels=cnn_channels[1]
-        )
+        # conv block with BatchNorm + residual-ish small stack
+        self.conv1 = nn.Conv1d(in_channels=input_feat, out_channels=cnn_channels[0],
+                               kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(cnn_channels[0])
+        self.pool1 = nn.MaxPool1d(kernel_size=2)
 
-        self.lstm = nn.LSTM(input_size=cnn_channels[1], hidden_size=hidden_size,
-                            num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.conv2 = nn.Conv1d(in_channels=cnn_channels[0], out_channels=cnn_channels[1],
+                               kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(cnn_channels[1])
+        self.pool2 = nn.MaxPool1d(kernel_size=2)
 
-        self.fc = nn.Linear(hidden_size, num_classes)
         self.dropout = nn.Dropout(dropout)
+
+        # Bidirectional LSTM -> more context
+        self.lstm = nn.LSTM(input_size=cnn_channels[1],
+                            hidden_size=hidden_size,
+                            num_layers=num_layers,
+                            batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0.0,
+                            bidirectional=True)
+
+        # Attention pooling (will pool outputs of LSTM)
+        self.att_pool = AttentionPool(feat_dim=hidden_size * 2)
+
+        # classification head
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_classes)
+        )
 
     def forward(self, x, lengths):
         # x: (batch, seq_len, feat)
-        # transpose -> (batch, feat, seq_len)
-        x = x.transpose(1, 2)
-        x = self.cnn(x)  # (batch, channels, seq_len_reduced)
-        x = x.transpose(1, 2)  # -> (batch, seq_len_reduced, channels)
+        x = x.transpose(1, 2)             # -> (batch, feat, seq_len)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = torch.relu(x)
+        x = self.pool1(x)
+        x = self.dropout(x)
 
-        # compute reduced lengths after pooling (/self.pool_factor)
-        # lengths might be on GPU; move to cpu for pack
-        lengths = lengths.detach()  # keep grad graph out of lengths
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = torch.relu(x)
+        x = self.pool2(x)
+        x = self.dropout(x)
+
+        x = x.transpose(1, 2)             # -> (batch, seq_len_reduced, channels)
+
+        # compute reduced lengths (after pooling)
         lengths_reduced = ((lengths + (self.pool_factor - 1)) // self.pool_factor).long()
+        # clamp to valid [1, x.size(1)]
+        max_len = x.size(1)
+        lengths_reduced = torch.clamp(lengths_reduced, min=1, max=max_len)
 
-        # --------- SAFETY: clamp to valid range -------------
-        max_len = x.size(1)  # actual temporal dim after cnn/pool
-        # ensure min 1 and max max_len
-        lengths_reduced = torch.clamp(lengths_reduced, min=1, max=max_len).long()
-
-        # optional debug assert (can comment out later)
-        if torch.any(lengths_reduced > max_len) or torch.any(lengths_reduced < 1):
-            # print some diagnostic info to help debugging
-            print("[BUG] lengths_reduced outside valid range!", lengths_reduced, "max_len=", max_len)
-            # clamp again just in case
-            lengths_reduced = torch.clamp(lengths_reduced, 1, max_len).long()
-
-        # pack: lengths must be on CPU
+        # pack for LSTM
         packed = pack_padded_sequence(x, lengths_reduced.cpu(), batch_first=True, enforce_sorted=True)
-        packed_out, (h_n, c_n) = self.lstm(packed)
-        last_hidden = h_n[-1]  # (batch, hidden_size)
-        out = self.fc(self.dropout(last_hidden))
-        return out
+        packed_out, _ = self.lstm(packed)
+        out_unpacked, _ = pad_packed_sequence(packed_out, batch_first=True)  # (batch, T_reduced, hidden*2)
+
+        # attention pooling over time (using lengths_reduced)
+        pooled = self.att_pool(out_unpacked, lengths_reduced.to(out_unpacked.device))  # (batch, hidden*2)
+
+        logits = self.fc(pooled)
+        return logits
 
 # ------------------------
 # == Validation
